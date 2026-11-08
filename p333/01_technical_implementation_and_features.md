@@ -1,0 +1,172 @@
+# Отчёт 1: Техническая реализация, функционал и глубокие настройки Deer-Flow
+
+Данный отчёт подготовлен на основе прямого и глубокого анализа исходного кода фреймворка **Deer-Flow** (репозиторий `bytedance/deer-flow`). Анализ выполнен исключительно по кодовой базе (Harness SDK, Gateway API, Runtime Engine, Sandbox Subsystem, Extensions & MCP, Skills System, Memory Subsystem, Persistence Layer), минуя документационные файлы README.
+
+---
+
+## 1. Введение и общая архитектура кодовой базы
+
+Кодовая база Deer-Flow представляет собой высокопроизводительный, строго типизированный производственный фреймворк для оркестрации LLM-агентов, субагентов и долгоживущих пайплайнов. Репозиторий чётко разделен на функциональные блоки:
+1. `backend/packages/harness` (`deerflow`): ядро исполнения агентов (Agent Harness SDK). Предоставляет фабрики создания агентов (`create_deerflow_agent`, `make_lead_agent`), управление жизненным циклом субагентов (`SubagentExecutor`, `SubagentBatchService`), стек middleware (более 25 специализированных компонентов), подсистему инструментов, песочниц и чекпоинтов.
+2. `backend/app/gateway`: API-шлюз на базе FastAPI / Starlette, отвечающий за REST и SSE endpoints, аутентификацию (Local, OIDC/SSO, PAT), управление сессиями, интеграции с внешними мессенджерами (Feishu/Lark, Slack, Telegram, Discord, DingTalk, WeChat) и вебхуками GitHub.
+3. `backend/packages/extension-api`: публичные интерфейсы и абстрактные базовые классы для расширения возможностей платформы плагинами.
+4. `skills`: библиотека исполняемых скиллов и деклараций возможностей с изолированными окружениями.
+5. `frontend`: веб-интерфейс на базе Next.js, React, TailwindCSS и Radix UI.
+
+---
+
+## 2. Глубокий разбор подсистем и конфигураций
+
+Система конфигурирования построена на базе моделей **Pydantic v2** (`BaseModel`, `Field`, валидаторы `@model_validator` и `@field_validator`) с поддержкой динамической перезагрузки без перезапуска процесса (через маркеры изменений и `reload_boundary.py`).
+
+### 2.1. Конфигурация ядра приложения (`AppConfig` в `deerflow/config/app_config.py`)
+
+Корневой класс `AppConfig` инкапсулирует глобальное состояние платформы:
+- `lead_prompt_overlay` (`PromptOverlay`): операторские накладки на системный промпт (поля `prepend: str` и `append: str`), позволяющие инжектировать статические политики безопасности или системные директивы в самое начало или конец системного промпта главного агента.
+- `log_level`: строковый уровень логирования (`DEBUG`, `INFO`, `WARNING`, `ERROR`).
+- `logging` (`LoggingConfig`): расширенное структурированное логирование. Поля: `enabled: bool`, `format: Literal["text", "json"]`, `enhance: LoggingEnhanceConfig` (включает/выключает трассировку ID запроса, контекст треда и маскирование чувствительных данных).
+- `recursion_limit` и `max_recursion_limit` (`int`): лимиты глубины рекурсии графа LangGraph (по умолчанию 50 и 100 соответственно), предотвращающие бесконечные циклы вызовов узлов.
+- `circuit_breaker` (`CircuitBreakerConfig`): предохранитель вызовов LLM.
+  - `failure_threshold: int` — количество ошибок подряд перед размыканием цепи;
+  - `recovery_timeout_sec: int` — время ожидания перед попыткой полуоткрытого состояния;
+  - `max_concurrent_calls: int` — ограничение одновременных вызовов к внешним провайдерам.
+- `llm_call` (`LlmCallConfig`): политики повторных попыток вызова LLM.
+  - `retry_max_attempts: int` — максимальное число повторов;
+  - `retry_base_delay_ms: int` — базовая задержка (экспоненциальный backoff);
+  - `retry_cap_delay_ms: int` — максимальный потолок задержки;
+  - `burst_retry_base_delay_ms: int` — задержка при обнаружении rate-limit всплесков.
+- `stream_bridge` (`StreamBridgeConfig | None`): брокер потоковой передачи SSE-событий (на базе in-memory очередей или Redis Streams).
+
+### 2.2. Управление субагентами (`SubagentsAppConfig` и `SubagentBatchesConfig`)
+
+Модули `deerflow/config/subagents_config.py` и `subagent_batches_config.py` содержат настройки субагентов:
+
+1. **Глобальные лимиты субагентов (`SubagentsAppConfig`)**:
+   - `timeout_seconds: int` (дефолт 300) — жесткий таймаут выполнения субагента;
+   - `max_turns: int | None` — ограничение на число итераций Tool/LLM цикла субагента;
+   - `max_total_per_run: int` — максимальное число порожденных субагентов в рамках одного запуска (run);
+   - `token_budget` (`TokenBudgetConfig`): квота токенов для субагентов;
+   - `agents: dict[str, SubagentOverrideConfig]` — переопределения встроенных субагентов (например, `bash_agent`, `general_purpose`);
+   - `custom_agents: dict[str, CustomSubagentConfig]` — декларации пользовательских субагентов (поля: `description`, `system_prompt`, `tools`, `disallowed_tools`, `skills`, `model`, `thinking_enabled`, `reasoning_effort`, `max_turns`, `timeout_seconds`).
+
+2. **Пакетная обработка (`SubagentBatchesConfig`)**:
+   - `enabled: bool` — включение службы долгоживущих пакетов;
+   - `poll_interval_seconds: float` — частота опроса очереди БД;
+   - `lease_seconds: int` — время эксклюзивного лизинга элемента пакета воркером (механизм распределенной аренды);
+   - `max_items_per_batch: int` — максимальное число подзадач в пакете;
+   - `default_max_live_items` и `max_live_items_per_batch: int` — лимиты одновременно выполняющихся задач одного пакета;
+   - `default_max_running_items` и `max_running_items_per_batch: int` — глобальные ограничения параллелизма воркера;
+   - `max_attempts: int` — число повторных попыток при аварии воркера;
+   - `max_result_chars` и `result_preview_max_chars` — лимиты размера сериализуемого результата.
+
+3. **Среда выполнения субагентов (`SubagentRuntimeConfig`)**:
+   - `max_running: int` — максимальное количество параллельно работающих субагентов на хосте;
+   - `max_queued: int` — максимальный размер очереди ожидания;
+   - `admission_policy: Literal["queue", "reject"]` — политика допуска при превышении емкости;
+   - `queue_timeout_seconds: int` — таймаут нахождения задачи в очереди.
+
+### 2.3. Изоляция и среда выполнения песочниц (`SandboxConfig`)
+
+В `deerflow/config/sandbox_config.py` определены глубокие настройки песочниц выполнения кода:
+- `use: str` — бэкенд песочницы (`local`, `docker`, `kubernetes`, `modal`, `e2b`);
+- `allow_host_bash: bool` — флаг безопасности, запрещающий исполнение команд на хостовой ОС без контейнеризации;
+- `prewarm: bool` и `prewarm_max_concurrent: int` — механизм предпрогрева (pre-warming) контейнеров для исключения холодных стартов;
+- `image: str | None` — базовый Docker-образ песочницы;
+- `overflow_policy: SandboxOverflowPolicy` — поведение при исчерпании пула контейнеров (`wait`, `fail`, `recycle_oldest`);
+- `acquire_timeout: int` — предельное время ожидания выделения песочницы;
+- `idle_timeout: int | None` — время простоя до утилизации (garbage collection) контейнера;
+- `network` (`SandboxNetworkConfig`):
+  - `mode: SandboxNetworkMode` — `isolated` (полный оффлайн), `restricted_whitelist` (только одобренные домены) или `allow_all`;
+  - `allow_domains: list[str]` — список разрешенных FQDN (например, `pypi.org`, `github.com`);
+  - `approval: SandboxNetworkApproval` — режим динамического согласования сетевого доступа;
+  - `temporary_grant_ttl: int` — время жизни временного разрешения на домен;
+  - `proxy_image: str` — образ прокси-фильтра сетевого трафика.
+- `ownership` (`SandboxOwnershipConfig`):
+  - `type: SandboxOwnershipType` — механизм синхронизации владения (`thread`, `run`, `redis`);
+  - `redis_url: str | None`, `renewal_interval_seconds: float`, `ttl_multiplier: float` — распределенный heartbeat песочницы в Redis.
+- `bash_output_max_chars`, `read_file_output_max_chars`, `ls_output_max_chars` — жесткие ограничения на объем вывода инструментов во избежание переполнения контекстного окна модели;
+- `bash_command_timeout: float` — таймаут одиночной команды Bash.
+
+### 2.4. Интеллектуальный контроль циклов и прогресса инструментов
+
+1. **Обнаружение зацикливания (`LoopDetectionConfig` в `deerflow/config/loop_detection_config.py`)**:
+   - `enabled: bool`;
+   - `threshold: int` — порог одинаковых вызовов инструментов для фиксации зацикливания;
+   - `distance_window: int` — скользящее окно истории шагов;
+   - `tool_freq_overrides: list[ToolFreqOverride]` — исключения и специализированные пороги частоты для определенных инструментов (например, `read_file` может вызываться чаще, чем деструктивные действия);
+   - `loop_handling_mode: Literal["warn", "halt"]` — инъекция системного предупреждения или немедленная остановка генерации.
+
+2. **Мониторинг стагнации (`ToolProgressConfig` в `deerflow/config/tool_progress_config.py`)**:
+   - `enabled: bool`;
+   - `stagnation_threshold: int` — количество итераций без смыслового прогресса;
+   - `jaccard_similarity_threshold: float` — мера Жаккара для сравнения аргументов последующих вызовов инструментов;
+   - `min_word_count_for_similarity: int` — минимальный объем текста аргументов для применения анализа схожести;
+   - `inject_assessment: bool` — инъекция корректирующих инструкций в контекст модели при выявлении зависания.
+
+### 2.5. Бюджетирование токенов и контекста (`TokenBudgetConfig`, `SummarizationConfig`)
+
+1. **Контроль бюджета (`TokenBudgetConfig`)**:
+   - `max_tokens: int` — суммарный лимит токенов на тред/запуск;
+   - `max_input_tokens`, `max_output_tokens: int | None` — раздельные потолки входных и выходных токенов;
+   - `warn_threshold: float` (например, 0.8) — уровень предупреждения, при котором агент информируется о приближении к исчерпанию лимита;
+   - `hard_stop_threshold: float` (например, 1.0) — порог безусловной блокировки дальнейших шагов.
+
+2. **Автоматическая компактизация контекста (`SummarizationConfig`)**:
+   - `enabled: bool`;
+   - `trigger: ContextSize | list[ContextSize]` — порог срабатывания суммаризации (может быть в токенах или в процентах от контекстного окна);
+   - `keep: ContextSize` — объем последних сообщений, сохраняемых без сжатия;
+   - `trim_tokens_to_summarize: int | None` — ограничение размера порции, отправляемой модели на редукцию;
+   - `model_name: str | None` — выделенная модель для быстрой и дешевой генерации резюме контекста;
+   - `skill_file_read_tool_names: list[str]` — исключение временных дампов чтения скиллов из постоянной истории.
+
+3. **Усечение вывода инструментов (`ToolOutputConfig`)**:
+   - `externalize_min_chars` — при превышении этого порога вывод инструмента выносится во внешнее хранилище (`storage_subdir`), а агенту возвращается ссылка-хэндл (`artifact://...`) с превью (`preview_head_chars`, `preview_tail_chars`);
+   - `elide_superseded_writes: bool` — подавление устаревших результатов промежуточной перезаписи файлов при повторном обращении.
+
+### 2.6. Память (`MemoryConfig`)
+
+Модуль `deerflow/config/memory_config.py` управляет долговременной памятью:
+- Поддерживаемые бэкенды: `noop`, `deermem` (встроенный модуль на базе локального хранилища и эмбеддингов), `openviking` (сетевой HTTP-сервис графовой памяти), `mem0`, `honcho`.
+- `MemoryPrescreenConfig`: фильтрация сообщений перед сохранением в память, отсекающая технические системные логи и нерелевантные промежуточные данные.
+- `MemorySignalClassificationConfig`: классификатор типа воспоминания (пользовательские предпочтения, фактические знания о проекте, рабочие инструкции).
+
+### 2.7. Модели и поддержка рассуждений (`ModelConfig`)
+
+Модуль `deerflow/config/model_config.py`:
+- `name: str`, `use: str` — унифицированная маршрутизация к OpenAI, Azure, Anthropic (Claude), DeepSeek, vLLM, MindIE, patched-MiniMax;
+- `supports_thinking: bool`, `supports_reasoning_effort: bool` — поддержка встроенных цепочек размышлений (CoT);
+- `reasoning: ReasoningCapabilities | bool | str | None` — контракт передачи параметров рассуждения (effort: `low`, `medium`, `high`, `budget_tokens`);
+- `when_thinking_enabled`, `when_thinking_disabled: dict | None` — тонкая корректировка параметров модели (temperature, top_p) в зависимости от активации режима размышлений;
+- `stream_chunk_timeout: float | None` — детектор зависания стриминга от LLM.
+
+### 2.8. База данных и чекпоинтер (`DatabaseConfig`, `CheckpointerConfig`)
+
+Модуль `deerflow/config/database_config.py`:
+- Поддержка SQLite и PostgreSQL (через асинхронный драйвер `asyncpg` и синхронный пул SQLAlchemy);
+- `CheckpointDeltaConfig`: стратегия сохранения диффов состояния.
+- `CheckpointGraphCacheConfig` и `CheckpointCacheConfig`: двухуровневое LRU/TTL кеширование узлов и дельт истории, обеспечивающее дедупликацию чтения неизменяемых исторических чекпоинтов.
+- `channel_mode: CheckpointChannelMode` — адаптация схемы каналов для оптимизации нагрузки на базу данных.
+
+---
+
+## 3. Технические преимущества реализации
+
+На основе глубокого разбора исходного кода выявлены ключевые технические преимущества реализации Deer-Flow:
+
+1. **Строгая типобезопасность и контрактная валидация**:
+   Все конфигурации, межмодульные состояния (`AgentState`, `ThreadDataState`, `SandboxState`) и события рантайма валидируются через схемы Pydantic v2. Это исключает передачу неконсистентных типов между слоями шлюза, ядра и провайдеров моделей.
+
+2. **Изолированный цикл событий субагентов (`_isolated_subagent_loop`)**:
+   В `deerflow/subagents/executor.py` субагенты запускаются не на общем EventLoop шлюза, а на выделенном изолированном цикле событий в отдельном потоке-демоне (`_run_isolated_subagent_loop`). Это предотвращает деградацию отзывчивости FastAPI шлюза и сетевого ввода-вывода при интенсивных вычислениях или блокировках внутри субагента.
+
+3. **Двухуровневое дельта-кеширование чекпоинтов (`cached_saver.py`)**:
+   Реализация `CachedCheckpointSaver` опирается на строгую математическую неизменяемость истории предков в графах LangGraph. Исторические дельты чекпоинтов кешируются как чистые функции от цепочки предков, что в разы сокращает обращения к дисковой SQLite или PostgreSQL при восстановлении контекста треда.
+
+4. **Механизм распределенной аренды задач (`BatchItemLease`)**:
+   Пакетное выполнение субагентов построено на атомарном лизинге строк базы данных с продлением аренды (heartbeat) и автоматическим восстановлением после аварийных завершений воркеров (failover).
+
+5. **Автоматическое управление контекстным окном (Context Compaction & Tool Externalization)**:
+   При получении огромных выводов от инструментов (например, чтение мегабайтных логов или запуск bash-скриптов) система автоматически сохраняет вывод во внешнее хранилище и возвращает компактное превью с дескриптором, исключая внезапный сбой по контексту модели (context overflow).
+
+6. **Многоуровневая система безопасности (Zero-Trust Sandbox & RBAC)**:
+   Строгая песочница с белыми списками доменов через прокси, PII-редактирование чувствительных данных (кредитные карты, ключи API, токены) на лету до отправки в модель, а также проверка квитанций вызовов инструментов (`ToolReceiptMiddleware`).
